@@ -848,6 +848,9 @@ button:focus{outline:none}
 @keyframes cog-spin{to{transform:rotate(360deg)}}
 .cog-options-notice{font-size:11.5px;color:#ad6800;background:#fff7e6;border:1px solid #faad14;border-radius:6px;padding:8px 10px;margin-bottom:10px;line-height:1.5}
 .cog-options-retry{border:none;background:none;color:#079d55;font-weight:600;cursor:pointer;padding:0;margin-left:4px;text-decoration:underline}
+.cog-doc-loading{display:flex;align-items:center;gap:12px;padding:48px 4px;font-size:13.5px;color:#8c8c8c;justify-content:center}
+.cog-doc-loading .cog-options-spinner{width:18px;height:18px;border-width:2.5px}
+.cog-doc-error-notice{font-size:12px;color:#ad6800;background:#fff7e6;border:1px solid #faad14;border-radius:6px;padding:10px 12px;margin-bottom:16px;line-height:1.5}
 
 /* Option cards */
 .cog-option{border:.5px solid #e1e1e1;border-radius:8px;padding:12px 14px;margin-bottom:14px;position:relative;transition:background 300ms ease}
@@ -3344,6 +3347,8 @@ const cogState = {
  collabStatusLine: '',
  aiOptionsCache: {}, // paraId -> generated [{id,label,text,recommend}] once fetched
  aiOptionsError: {}, // paraId -> error message, if the last fetch failed
+ docGenLoading: false, // true while a live workspace document is being generated
+ docGenError: null, // error message if the last document generation failed
 };
 
 /* ── Role-status helpers ── */
@@ -3409,7 +3414,7 @@ function cogUpdateAlignPct() {
  const total = COG_PARAS.filter(p => p.conflict).length;
  const adopted = Object.keys(cogState.adoptedParas).length;
  const fullyConfirmed = COG_PARAS.filter(p => p.conflict && cogAllRolesConfirmed(p.id)).length;
- const pct = Math.min(100, Math.round(72 + (adopted / total) * 8 + (fullyConfirmed / total) * 20));
+ const pct = total===0 ? 100 : Math.min(100, Math.round(72 + (adopted / total) * 8 + (fullyConfirmed / total) * 20));
  cogState.alignPct = pct;
  cogInitAlignRingIfNeeded();
  const active = Math.max(0, Math.min(12, Math.round(pct / 100 * 12)));
@@ -3669,7 +3674,7 @@ const COG_KB_LIST = {
  ]
 };
 
-const COG_DOC = `# Phased push plan
+let COG_DOC = `# Phased push plan
 
 ## Background and goals
 
@@ -3691,7 +3696,7 @@ Low-activity users (DAU Bottom 30%) push strategy needs to align with the curren
 
 click-through-rate improvement of 15%, day-1 retention improvement of 5%, with 7 days as the observation window; data needs to feed into a real-time dashboard for tracking results.`;
 
-const COG_PARAS = [
+let COG_PARAS = [
  {id:1, text:'This plan aims to maximize push efficiency through fine-grained user-tier targeting, without harming user experience; expected click-through rate increase 15%, Day-1 retention improvement 5%.', conflict:false},
  {id:2, text:'Apply differentiated push timing and content formats for users at different activity tiers; high-activity users (DAU Top 30%) get the full feature introduction pushed immediately, while medium-activity users get a simplified version delayed by 72 hours.', conflict:false},
  {id:3, text:'The product side needs the complete push plan launched within 5 days; engineering estimates the basic version needs 3 days, while the full version including A/B testing needs 7 days — there\'s disagreement on scheduling and resource allocation, and priority needs to be confirmed by all parties.',
@@ -3710,6 +3715,52 @@ const COG_PARAS = [
  stances:{product:'product isn\'t leading this part — it needs to be driven by ops',ops:'the schedule isn\'t fixed, so no time commitment can be given'},
  },
 ];
+
+const COG_DOC_DEFAULT = COG_DOC;
+const COG_PARAS_DEFAULT = COG_PARAS;
+
+// Live-generate a full planning document (title + sections, some flagged as
+// stakeholder conflicts) for an arbitrary user goal via Gemini.
+async function cogGenerateWorkspaceDoc(goal){
+ const prompt = `Write a short internal planning document for this goal:\n"${goal}"\n\nRespond as a JSON object: {"title": string, "sections": [...]}. Generate 4 to 6 sections. Each section is {"heading": short section title, "text": a 1-3 sentence paragraph body, "conflict": boolean}. Exactly 1 or 2 sections should have "conflict": true — a genuine, specific disagreement between Product, Engineering, and Ops about this plan (timeline, scope, resourcing, or definition of done). For every section where "conflict" is true, ALSO include: "concerns" ({"product": "...", "tech": "...", "ops": "..."} — one sentence each, what that side is worried about), "stances" ({"product": "...", and either "tech" or "ops": "..." — whichever role is most directly opposed to product here, one sentence each stating their position}), and "conflictSummary" (one sentence summarizing the disagreement). Sections with "conflict": false must NOT include concerns, stances, or conflictSummary. Return ONLY the JSON object, no other text.`;
+ const data = await callGemini({
+ json: true,
+ system: 'You draft realistic, concrete internal team planning documents for a workflow tool, grounded in the goal the user gives you. Avoid vague corporate filler — be specific.',
+ prompt,
+ });
+ if(!data || !Array.isArray(data.sections) || data.sections.length === 0) throw new Error('Unexpected response shape.');
+ return data;
+}
+
+// Rebuild COG_DOC (markdown string) and COG_PARAS (structured array) from a
+// generated {title, sections} object, and clear per-paragraph state that was
+// tied to the previous document.
+function cogApplyGeneratedDoc(data){
+ const title = data.title || 'Untitled plan';
+ const sections = data.sections;
+ COG_DOC = `# ${title}\n\n` + sections.map(s=>`## ${s.heading||''}\n\n${s.text||''}\n\n`).join('').trim();
+ COG_PARAS = sections.map((s,i)=>({
+ id: i+1,
+ text: s.text || '',
+ conflict: !!s.conflict,
+ concerns: s.conflict ? s.concerns : undefined,
+ stances: s.conflict ? s.stances : undefined,
+ conflictSummary: s.conflict ? s.conflictSummary : undefined,
+ }));
+ cogState.adoptedParas = {};
+ cogState.paraRoleStatus = {};
+ cogState.customProposals = {};
+ cogState.aiOptionsCache = {};
+ cogState.aiOptionsError = {};
+ cogState.convertedTasks = [];
+ cogState.collabBarVisible = false;
+ cogState.collabStatusLine = '';
+}
+
+function cogRestoreDefaultDoc(){
+ COG_DOC = COG_DOC_DEFAULT;
+ COG_PARAS = COG_PARAS_DEFAULT;
+}
 
 const COG_OPTIONS_FALLBACK = [
  {id:'A', label:'leans toward product\'s side', text:'Prioritize the 5-day schedule, trim functionality down to core push only, and add A/B testing in a later iteration — this meets the business commitment.'},
@@ -3769,6 +3820,15 @@ function cogInitWorkspace() {
  const edBody = document.getElementById('cogEditorBody');
  if(edBody) {
  edBody.innerHTML = '';
+ if(cogState.docGenLoading){
+ edBody.innerHTML = '<div class="cog-doc-loading"><div class="cog-options-spinner"></div>Drafting your document…</div>';
+ } else {
+ if(cogState.docGenError){
+ const notice = document.createElement('div');
+ notice.className = 'cog-doc-error-notice';
+ notice.textContent = `Couldn't reach the model (${cogState.docGenError}) — showing the example plan instead.`;
+ edBody.appendChild(notice);
+ }
  const lines = COG_DOC.split('\n');
  lines.forEach(line => {
  if(!line.trim()) { const d=document.createElement('div'); d.style.height='8px'; edBody.appendChild(d); return; }
@@ -3778,6 +3838,7 @@ function cogInitWorkspace() {
  else { d.className='cog-doc-p'; d.textContent=line; }
  edBody.appendChild(d);
  });
+ }
  }
 
  // Members
@@ -3804,7 +3865,24 @@ function cogInitWorkspace() {
 function cogInitBoard() {
  const container = document.getElementById('cogDocInner');
  if(!container) return;
- container.innerHTML = '<h1 class="cog-doc-h1" style="margin-bottom:20px">Phased push plan</h1>';
+
+ if(cogState.docGenLoading){
+ container.innerHTML = '<div class="cog-doc-loading"><div class="cog-options-spinner"></div>Drafting your document…</div>';
+ return;
+ }
+
+ container.innerHTML = '';
+ if(cogState.docGenError){
+ const notice = document.createElement('div');
+ notice.className = 'cog-doc-error-notice';
+ notice.textContent = `Couldn't reach the model (${cogState.docGenError}) — showing the example plan instead.`;
+ container.appendChild(notice);
+ }
+ const h1 = document.createElement('h1');
+ h1.className = 'cog-doc-h1';
+ h1.style.marginBottom = '20px';
+ h1.textContent = (COG_DOC.split('\n')[0]||'').replace(/^#\s*/,'') || 'Plan';
+ container.appendChild(h1);
 
  COG_PARAS.forEach(para => {
  if(!para.conflict) {
@@ -3842,7 +3920,7 @@ function cogInitBoard() {
  const isMyRole = role === COG_ME.roleKey;
  return `<div class="ct-col">
  <div class="ct-col-head">${labels[role]}</div>
- <div class="ct-col-text">${para.concerns[role]}</div>
+ <div class="ct-col-text">${(para.concerns&&para.concerns[role])||'—'}</div>
  <div class="ct-col-status ${statusClass}" id="ct-col-status-${para.id}-${role}">
  <div class="dot"></div>
  <span>${status}</span>
@@ -4037,12 +4115,12 @@ function cogRenderDrawerBody(paraId) {
  <div class="cog-stance-row">
  <div class="cog-stance-card">
  <div class="cog-stance-role">Product\'s position</div>
- <div class="cog-stance-text">${para.stances.product}</div>
+ <div class="cog-stance-text">${(para.stances&&para.stances.product)||'—'}</div>
  </div>
  <div class="cog-stance-div"></div>
  <div class="cog-stance-card">
- <div class="cog-stance-role">${para.stances.ops ? 'Ops\'s position': 'Engineering\'s position'}</div>
- <div class="cog-stance-text">${para.stances.ops || para.stances.tech}</div>
+ <div class="cog-stance-role">${para.stances&&para.stances.ops ? 'Ops\'s position': 'Engineering\'s position'}</div>
+ <div class="cog-stance-text">${(para.stances&&(para.stances.ops||para.stances.tech))||'—'}</div>
  </div>
  </div>
  <div class="cog-options-label">AI Proposed plan</div>
@@ -4211,7 +4289,7 @@ function cogBuildGoal(root){
  if(depthOpt) lines.push('【Task depth·'+depthOpt.dataset.tier+'】');
  let goal=lines.join(' ');
  if(cogState.selectedKbs.size>0) goal+=(goal?' ':'')+'【Linked knowledge base】'+[...cogState.selectedKbs].join(', ');
- if(user) goal+=(goal?'\n':'')+'【Additional note】'+user;
+ if(user) goal+=goal?('\n【Additional note】'+user):user;
  if(!goal.trim()) goal='Cognitive-dispatch task';
  return goal.trim();
 }
@@ -4222,7 +4300,9 @@ function cogEntryUpdateSend(root,sendBtn){
  const hasPill=root.querySelector('.cog-float-pill.is-on');
  const hasDepth=root.querySelector('.cog-depth-opt.is-on');
  const hasKb=cogState.selectedKbs.size>0;
- sendBtn.disabled=!(hasQ||hasPill||hasDepth||hasKb);
+ const ta=root.querySelector('.cog-float-ta')||root.querySelector('#cogSearchInput');
+ const hasText=!!(ta&&ta.value.trim());
+ sendBtn.disabled=!(hasQ||hasPill||hasDepth||hasKb||hasText);
 }
 
 function cogResetEntryPanel(root){
@@ -4399,6 +4479,30 @@ function initCogEntryPanel(root){
  fl.setAttribute('aria-hidden','true');
  }
  openPage('cogWorkspace');
+
+ // Live-generate the workspace document from the goal (replaces the fixed demo doc)
+ cogState.docGenLoading = true;
+ cogState.docGenError = null;
+ const top0 = pageStack[pageStack.length-1];
+ if(top0==='cogWorkspace' && typeof cogInitWorkspace==='function') cogInitWorkspace();
+ if(top0==='cogBoard' && typeof cogInitBoard==='function') cogInitBoard();
+
+ const genForGoal = q;
+ cogGenerateWorkspaceDoc(genForGoal).then(data=>{
+ if(cogState.goal!==genForGoal) return; // a newer goal was submitted meanwhile
+ cogApplyGeneratedDoc(data);
+ }).catch(err=>{
+ if(cogState.goal!==genForGoal) return;
+ cogState.docGenError = err.message || 'Could not reach the model.';
+ cogRestoreDefaultDoc();
+ }).finally(()=>{
+ if(cogState.goal!==genForGoal) return;
+ cogState.docGenLoading = false;
+ const top = pageStack[pageStack.length-1];
+ if(top==='cogWorkspace' && typeof cogInitWorkspace==='function') cogInitWorkspace();
+ if(top==='cogBoard' && typeof cogInitBoard==='function') cogInitBoard();
+ if(typeof cogUpdateAlignPct==='function') cogUpdateAlignPct();
+ });
  }
  window.cogSubmitGoal=doSearch;
 
